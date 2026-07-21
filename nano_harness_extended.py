@@ -14,7 +14,11 @@ from openai import OpenAI
 # 1. CONFIGURAÇÕES GERAIS
 # ==========================================
 
-TASK = "Inspecionar a pasta do projeto e fazer um resumo."
+TASK = """
+Use the hf_search tool to search for bert models on Hugging Face.
+Summarize the top 3 results returned by the tool.
+Do not answer from memory.
+"""
 
 MODEL = os.getenv("NANO_MODEL", "zai-org/GLM-5.1")
 BASE_URL = os.getenv(
@@ -215,12 +219,12 @@ def extract_code(content):
 
 def ask_model(client, messages):
     """Chama o modelo usando Chat Completions."""
-response = client.chat.completions.create(
-    model=MODEL,
-    messages=messages,
-    temperature=TEMPERATURE,
-    max_tokens=1000,
-)
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=TEMPERATURE,
+        max_tokens=1000,
+    )
 
     if not response.choices:
         raise RuntimeError("A API respondeu sem nenhuma opção.")
@@ -310,13 +314,30 @@ def main():
             stderr_buffer = io.StringIO()
 
             exec_globals = {
-                "__builtins__": {},
+                "__builtins__": {
+                    "str": str,
+                    "len": len,
+                    "enumerate": enumerate,
+                    "range": range,
+                    "list": list,
+                    "dict": dict,
+                    "float": float,
+                    "int": int,
+                    "min": min,
+                    "max": max,
+                    "sum": sum,
+                },
                 "list_dir": list_dir,
                 "read_file": read_file,
                 "write_file": write_file,
                 "exec_cmd": exec_cmd,
+                "web_fetch": web_fetch,
+                "hf_search": hf_search,
+                "git_log": git_log,
+                "json_parse": json_parse,
+                "compute_stats": compute_stats,
                 "final_answer": final_answer,
-                "print": print,
+                "json": json,
             }
 
             with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):

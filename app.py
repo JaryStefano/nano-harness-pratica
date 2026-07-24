@@ -6,13 +6,15 @@ import urllib.error
 import pandas as pd
 import gradio as gr
 import requests
+import tempfile
+from pathlib import Path
 
 # --- Constants ---
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 MODEL = os.getenv("NANO_MODEL", "gpt-4o-mini")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("HF_TOKEN", "")
-MAX_STEPS = 10
+MAX_STEPS = 8
 
 
 # --- Tool Definitions (OpenAI function calling format) ---
@@ -184,12 +186,87 @@ def web_fetch(url, max_bytes=100000):
         return f"Fetch error: {type(e).__name__}: {e}"
 
 def read_file(path):
-    """Read a file's content."""
+    """Read supported local attachments."""
     try:
-        with open(path, "r", errors="replace") as f:
-            return f.read(10000)
+        file_path = Path(path)
+
+        if not file_path.exists():
+            return (
+                f"File unavailable: {path}. "
+                "Do not invent its contents. Solve using another source when possible."
+            )
+
+        suffix = file_path.suffix.lower()
+
+        if suffix in {".txt", ".py", ".json", ".md", ".csv"}:
+            return file_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )[:30000]
+
+        if suffix in {".xlsx", ".xls"}:
+            sheets = pd.read_excel(file_path, sheet_name=None)
+            parts = []
+
+            for sheet_name, dataframe in sheets.items():
+                parts.append(
+                    f"Sheet: {sheet_name}\n"
+                    f"{dataframe.to_csv(index=False)}"
+                )
+
+            return "\n\n".join(parts)[:40000]
+
+        if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+            return (
+                f"Image attachment available at: {file_path}. "
+                "This text-only file reader cannot inspect image pixels."
+            )
+
+        if suffix in {".mp3", ".wav", ".m4a", ".ogg"}:
+            return (
+                f"Audio attachment available at: {file_path}. "
+                "This text-only file reader cannot transcribe audio."
+            )
+
+        return (
+            f"Unsupported attachment type: {suffix}. "
+            f"Local path: {file_path}"
+        )
+
     except Exception as e:
-        return f"File error: {e}"
+        return f"File error: {type(e).__name__}: {e}"
+
+
+def download_attachment(task_id, file_name):
+    """Attempt to download the attachment associated with a task."""
+    if not task_id or not file_name:
+        return None
+
+    url = f"{DEFAULT_API_URL}/files/{task_id}"
+
+    try:
+        response = requests.get(url, timeout=30)
+
+        if response.status_code != 200 or not response.content:
+            print(
+                f"Attachment unavailable for {task_id}: "
+                f"HTTP {response.status_code}"
+            )
+            return None
+
+        safe_name = Path(file_name).name
+        local_path = Path(tempfile.gettempdir()) / safe_name
+        local_path.write_bytes(response.content)
+
+        print(f"Attachment downloaded: {local_path}")
+        return str(local_path)
+
+    except Exception as e:
+        print(
+            f"Attachment download error for {task_id}: "
+            f"{type(e).__name__}: {e}"
+        )
+        return None
 
 
 def calculator(expression):
@@ -230,8 +307,24 @@ class ToolAgent:
         self.client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
         print(f"ToolAgent initialized. Model: {MODEL}")
 
-    def __call__(self, question: str) -> str:
+    def __call__(self, question: str, attachment_path=None) -> str:
         print(f"\nQuestion: {question[:100]}...")
+
+        user_prompt = question
+
+        if attachment_path:
+            user_prompt += (
+                f"\n\nThe attachment was downloaded to this exact local path: "
+                f"{attachment_path}\n"
+                "Use read_file with this exact path when the attachment is textual "
+                "or tabular. Never invent a different filename."
+            )
+        elif "attached" in question.lower() or "provided in the image" in question.lower():
+            user_prompt += (
+                "\n\nWarning: the referenced attachment could not be downloaded "
+                "from the evaluation server. Do not invent its contents. "
+                "Use web research only when the same information can be obtained elsewhere."
+            )
 
         messages = [
             {
@@ -240,18 +333,23 @@ class ToolAgent:
         "You are an autonomous research agent.\n\n"
         "Your goal is to answer questions correctly, not quickly.\n\n"
         "Rules:\n"
-        "- Never guess.\n"
-        "- If you don't know, search the web.\n"
-        "- If search returns useful URLs, fetch the page.\n"
-        "- Read the fetched content before answering.\n"
-        "- If the first search fails, try a different search query.\n"
+        "- Never guess or invent evidence.\n"
+        "- Follow the answer format requested by the user exactly.\n"
+        "- If the question is written backwards, interpret it carefully before answering.\n"
+        "- If you do not know an answer, search the web.\n"
+        "- Use precise search queries containing names, dates and quoted phrases.\n"
+        "- Read useful pages before answering.\n"
+        "- A 403, timeout, bot check or irrelevant result is not evidence.\n"
+        "- When a page fails, search again and use another source.\n"
+        "- Prefer official sources, primary sources and reliable reference works.\n"
         "- Use calculator for mathematical questions.\n"
-        "- Use read_file when a question refers to an attached file.\n"
-        "- Only call final_answer when you are confident.\n"
-        "- Return only the final answer, with no explanations or markdown."
+        "- Use read_file with the exact local path supplied for attachments.\n"
+        "- Verify names, dates, totals and requested ordering before answering.\n"
+        "- Only call final_answer when the requested output is ready.\n"
+        "- Return only the final answer, with no explanation or markdown."
     ),
 },
-            {"role": "user", "content": question},
+            {"role": "user", "content": user_prompt},
         ]
 
         for step in range(MAX_STEPS):
@@ -261,7 +359,7 @@ class ToolAgent:
                 tools=TOOLS,
                 tool_choice="auto",
                 temperature=0,
-                max_tokens=500,
+                max_tokens=900,
             )
 
             msg = response.choices[0].message
@@ -274,7 +372,19 @@ class ToolAgent:
                 messages.append({"role": "assistant", "content": msg.content or ""})
 
             if not msg.tool_calls:
-                return (msg.content or "").strip()
+                answer = (msg.content or "").strip()
+
+                if answer:
+                    return answer
+
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response was empty. Continue solving the task. "
+                        "Use another search query or tool, then provide the exact final answer."
+                    ),
+                })
+                continue
 
             for tc in msg.tool_calls:
                 fn_name = tc.function.name
@@ -325,10 +435,18 @@ def run_and_submit_all():
     for item in questions_data:
         task_id = item.get("task_id")
         question_text = item.get("question")
+        file_name = item.get("file_name", "")
+
         if not task_id or question_text is None:
             continue
+
+        attachment_path = download_attachment(task_id, file_name)
+
         try:
-            answer = agent(question_text)
+            answer = agent(
+                question_text,
+                attachment_path=attachment_path,
+            )
             answers_payload.append({"task_id": task_id, "submitted_answer": answer})
             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": answer})
         except Exception as e:

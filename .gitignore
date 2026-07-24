@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 *.backup
 *.save
+
+app_backup.py
+teste_gemini.py
